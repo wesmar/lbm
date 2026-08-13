@@ -39,6 +39,9 @@ str_swStatus       dw '-','-','s','t','a','t','u','s',0
 str_swStatusS      dw '-','s',0
 str_swSet          dw '-','-','s','e','t',0
 str_swDisable      dw '-','-','d','i','s','a','b','l','e',0
+str_swDefaults     dw '-','-','d','e','f','a','u','l','t','s',0
+str_swDefault      dw '-','-','d','e','f','a','u','l','t',0
+str_swDefaultShort dw '-','d',0
 str_swGui          dw '-','-','g','u','i',0
 str_swGuiShort     dw '-','g',0
 str_swHelp         dw '-','-','h','e','l','p',0
@@ -49,11 +52,12 @@ str_cliUsage       db "Usage: lbm.exe [option]",0Dh,0Ah
                    db "  lbm.exe                          Display current charge thresholds",0Dh,0Ah
                    db "  lbm.exe --status                 Display current charge thresholds",0Dh,0Ah
                    db "  lbm.exe --set <start> <stop>     Enable and set thresholds (example: 80 85)",0Dh,0Ah
+                   db "  lbm.exe --defaults, -d           Apply the default thresholds (80 85)",0Dh,0Ah
                    db "  lbm.exe --disable                Disable thresholds and charge to 100%",0Dh,0Ah
                    db "  lbm.exe --gui                    Launch the Mica GUI",0Dh,0Ah
                    db "  lbm.exe --help                   Display this help",0Dh,0Ah
                    db 0Dh,0Ah,"Notes:",0Dh,0Ah
-                   db "  --set and --disable elevate through UAC when required.",0Dh,0Ah
+                   db "  --set, --defaults and --disable elevate through UAC when required.",0Dh,0Ah
                    db "  Valid percentages are 0..100 and start must be lower than stop.",0Dh,0Ah,0
 
 str_cliBarcode     db "[+] Battery Barcode  : ",0
@@ -347,6 +351,26 @@ cli_begin:
     test eax, eax
     jnz do_disable_cli
 
+    ; Accept both spellings: the GUI button reads "Defaults", and "--default"
+    ; is the form people type.
+    mov rdx, qword ptr [rsi + 8]
+    lea rcx, str_swDefaults
+    call WStrCmpI
+    test eax, eax
+    jnz do_default_cli
+
+    mov rdx, qword ptr [rsi + 8]
+    lea rcx, str_swDefault
+    call WStrCmpI
+    test eax, eax
+    jnz do_default_cli
+
+    mov rdx, qword ptr [rsi + 8]
+    lea rcx, str_swDefaultShort
+    call WStrCmpI
+    test eax, eax
+    jnz do_default_cli
+
     mov rdx, qword ptr [rsi + 8]
     lea rcx, str_swHelp
     call WStrCmpI
@@ -450,6 +474,23 @@ set_err:
 
 input_err:
     lea rcx, str_cliInputFail
+    call PrintAStr
+    jmp finish_cli
+
+do_default_cli:
+    ; The GUI button only loads the pair into the sliders and waits for Apply.
+    ; The CLI has nothing to preview, so it writes straight through.
+    call EnsureAdminPrivileges
+    test eax, eax
+    jz set_err
+
+    mov r8d, 1
+    mov edx, LBM_DEFAULT_STOP
+    mov ecx, LBM_DEFAULT_START
+    call Lbm_SetBatteryThresholds
+    test eax, eax
+    jz set_err
+    lea rcx, str_cliSuccess
     call PrintAStr
     jmp finish_cli
 

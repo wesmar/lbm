@@ -54,7 +54,7 @@ enable state as a checkbox, and three buttons:
 | Button | Action |
 |---|---|
 | `Apply Settings` | Writes the pair on screen to the registry and the driver. This is the default button, so Enter presses it. |
-| `Defaults` | Loads the Lenovo Vantage pair `80/85` into the sliders and ticks the box. Nothing reaches the driver until Apply. |
+| `Defaults` | Loads the Lenovo Vantage pair `80/85` into the sliders and ticks the box. Nothing reaches the driver until Apply, unlike the `--defaults` switch, which has nothing to preview and writes straight through. |
 | `Charge to 100%` | Releases the limit immediately and parks both thumbs at the right end. |
 
 The sliders are the switch, and they have exactly two shapes:
@@ -83,6 +83,7 @@ lbm.exe
 lbm.exe --status
 lbm.exe -s
 lbm.exe --set 80 85
+lbm.exe --defaults
 lbm.exe --disable
 lbm.exe --help
 ```
@@ -91,6 +92,7 @@ lbm.exe --help
 |---|---|
 | `--status`, `-s` | Read and display the current battery configuration |
 | `--set <start> <stop>` | Enable thresholds and apply both percentages |
+| `--defaults`, `--default`, `-d` | Enable and apply the default pair `80/85` |
 | `--disable` | Disable threshold mode and return to automatic charging |
 | `--gui`, `-g` | Open the graphical interface |
 | `--help`, `-h` | Display command-line usage |
