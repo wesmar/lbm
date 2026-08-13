@@ -32,6 +32,8 @@ EXTRN SetWindowPos:PROC
 EXTRN GetDpiForSystem:PROC
 EXTRN GetDpiForWindow:PROC
 EXTRN EnumChildWindows:PROC
+EXTRN AdjustWindowRectExForDpi:PROC
+EXTRN IsDialogMessageW:PROC
 
 EXTRN Lbm_GetBatteryThresholds:PROC
 EXTRN Lbm_SetBatteryThresholds:PROC
@@ -52,8 +54,11 @@ str_lblStart       dw 'C','h','a','r','g','e',' ','S','t','a','r','t',' ','T','h
 str_lblStop        dw 'C','h','a','r','g','e',' ','S','t','o','p',' ','T','h','r','e','s','h','o','l','d',' ',':',0
 str_chkText        dw 'E','n','a','b','l','e',' ','B','a','t','t','e','r','y',' ','C','h','a','r','g','e',' ','L','i','m','i','t','s',0
 str_btnApplyText   dw 'A','p','p','l','y',' ','S','e','t','t','i','n','g','s',0
+str_btnDefaultsText dw 'D','e','f','a','u','l','t','s',0
 str_btnDisableText dw 'C','h','a','r','g','e',' ','t','o',' ','1','0','0','%',0
 str_statusReady    dw 'C','o','m','p','a','t','i','b','l','e',' ','L','e','n','o','v','o',' ','b','a','t','t','e','r','y',' ','d','e','t','e','c','t','e','d','.',0
+str_statusLimited  dw 'C','h','a','r','g','e',' ','l','i','m','i','t','s',' ','a','r','e',' ','a','c','t','i','v','e','.',0
+str_statusFull     dw 'C','h','a','r','g','e',' ','l','i','m','i','t','s',' ','a','r','e',' ','o','f','f',' ','-',' ','c','h','a','r','g','i','n','g',' ','t','o',' ','1','0','0','%','.',0
 str_statusMissing  dw 'N','o',' ','c','o','m','p','a','t','i','b','l','e',' ','L','e','n','o','v','o',' ','b','a','t','t','e','r','y',' ','w','a','s',' ','f','o','u','n','d','.',0
 
 str_msgSuccess     dw 'B','a','t','t','e','r','y',' ','t','h','r','e','s','h','o','l','d','s',' ','h','a','v','e',' ','b','e','e','n',' '
@@ -89,6 +94,16 @@ SCALE_ARG MACRO stackOffset:req, logicalValue:req
     idiv ecx
     movsxd rax, eax
     mov qword ptr [rsp+stackOffset], rax
+ENDM
+
+; Same conversion, stored as a DWORD for RECT members.
+SCALE_D MACRO stackOffset:req, logicalValue:req
+    mov eax, logicalValue
+    imul eax, dword ptr [g_uDpi]
+    cdq
+    mov ecx, 96
+    idiv ecx
+    mov dword ptr [rsp+stackOffset], eax
 ENDM
 
 .code
@@ -196,6 +211,63 @@ fp_suffix:
     ret
 FormatPctStr endp
 
+; RCX = trackbar handle. Draws a tick for every step and makes the keyboard and
+; the page area move by one step, so no input path can leave the grid.
+ApplyStepMetrics proc
+    push rbx
+    sub rsp, 32
+
+    mov rbx, rcx
+
+    mov r9d, 0
+    mov r8d, LBM_STEP
+    mov edx, TBM_SETTICFREQ
+    mov rcx, rbx
+    call SendMessageW
+
+    mov r9d, LBM_STEP
+    xor r8d, r8d
+    mov edx, TBM_SETPAGESIZE
+    mov rcx, rbx
+    call SendMessageW
+
+    mov r9d, LBM_STEP
+    xor r8d, r8d
+    mov edx, TBM_SETLINESIZE
+    mov rcx, rbx
+    call SendMessageW
+
+    add rsp, 32
+    pop rbx
+    ret
+ApplyStepMetrics endp
+
+; ECX = raw percentage, EAX = the same value pulled onto the five-percent grid.
+; Leaf routine: it touches only volatile registers and makes no calls.
+SnapToStep proc
+    mov eax, ecx
+    add eax, LBM_STEP / 2       ; Round half up instead of truncating down.
+    xor edx, edx
+    mov ecx, LBM_STEP
+    div ecx
+    imul eax, eax, LBM_STEP
+    ret
+SnapToStep endp
+
+; EAX = value, ECX = minimum, EDX = maximum. Returns the clamped value in EAX.
+ClampRange proc
+    cmp eax, ecx
+    jae cr_check_max
+    mov eax, ecx
+    ret
+cr_check_max:
+    cmp eax, edx
+    jbe cr_done
+    mov eax, edx
+cr_done:
+    ret
+ClampRange endp
+
 UpdateUIState proc
     sub rsp, 328
 
@@ -209,25 +281,86 @@ UpdateUIState proc
     call SetWindowTextW
 
     ; Keep the GUI usable with conservative defaults when discovery fails.
-    mov dword ptr [rsp+40 + LBM_BATTERY_THRESHOLD.startPercentage], 75
-    mov dword ptr [rsp+40 + LBM_BATTERY_THRESHOLD.stopPercentage], 80
-    mov dword ptr [rsp+40 + LBM_BATTERY_THRESHOLD.startEnabled], 1
-    jmp uis_load_data
+    mov dword ptr [rsp+40 + LBM_BATTERY_THRESHOLD.startPercentage], LBM_DEFAULT_START
+    mov dword ptr [rsp+40 + LBM_BATTERY_THRESHOLD.stopPercentage], LBM_DEFAULT_STOP
+    mov dword ptr [rsp+40 + LBM_BATTERY_THRESHOLD.startEnabled], 0
+    mov dword ptr [rsp+40 + LBM_BATTERY_THRESHOLD.stopEnabled], 0
+    jmp uis_set_positions       ; Already on the grid and inside both ranges.
 
 uis_found:
-    lea rdx, str_statusReady
+    ; Report the live threshold state; a generic "battery detected" line hides
+    ; whether the limit is currently holding the pack back.
+    lea rdx, str_statusLimited
+    cmp dword ptr [rsp+40 + LBM_BATTERY_THRESHOLD.startEnabled], 0
+    jne uis_status_ready
+    cmp dword ptr [rsp+40 + LBM_BATTERY_THRESHOLD.stopEnabled], 0
+    jne uis_status_ready
+    lea rdx, str_statusFull
+
+uis_status_ready:
     mov rcx, g_hLblStatus
     call SetWindowTextW
 
 uis_load_data:
-    ; Disabled threshold controls mean unrestricted charging. Present that state
-    ; as 100% on both sliders instead of exposing stale registry percentages.
+    ; A disabled configuration can hold percentages outside the slider ranges
+    ; (or an inverted pair). Fall back to a valid pair before driving controls,
+    ; otherwise the labels and the thumbs disagree.
+    mov eax, dword ptr [rsp+40 + LBM_BATTERY_THRESHOLD.startPercentage]
+    mov ecx, dword ptr [rsp+40 + LBM_BATTERY_THRESHOLD.stopPercentage]
+    cmp eax, LBM_SLIDER_START_MIN
+    jb uis_use_defaults
+    cmp ecx, LBM_SLIDER_STOP_MAX
+    ja uis_use_defaults
+    cmp eax, ecx
+    jb uis_snap
+
+uis_use_defaults:
+    mov dword ptr [rsp+40 + LBM_BATTERY_THRESHOLD.startPercentage], LBM_DEFAULT_START
+    mov dword ptr [rsp+40 + LBM_BATTERY_THRESHOLD.stopPercentage], LBM_DEFAULT_STOP
+
+uis_snap:
+    ; The CLI and other tools can store any percentage, but a thumb only
+    ; represents a grid position. Align first so the thumbs, the tick marks and
+    ; the labels cannot disagree.
+    mov ecx, dword ptr [rsp+40 + LBM_BATTERY_THRESHOLD.startPercentage]
+    call SnapToStep
+    mov ecx, LBM_SLIDER_START_MIN
+    mov edx, LBM_SLIDER_START_MAX
+    call ClampRange
+    mov dword ptr [rsp+40 + LBM_BATTERY_THRESHOLD.startPercentage], eax
+
+    mov ecx, dword ptr [rsp+40 + LBM_BATTERY_THRESHOLD.stopPercentage]
+    call SnapToStep
+    mov ecx, LBM_SLIDER_STOP_MIN
+    mov edx, LBM_SLIDER_STOP_MAX
+    call ClampRange
+    mov dword ptr [rsp+40 + LBM_BATTERY_THRESHOLD.stopPercentage], eax
+
+    ; A released limit parks both thumbs at the right end, the same position the
+    ; sliders themselves use for "no limit". The stored pair stays untouched in
+    ; the registry, so Defaults and --status still recover it.
     cmp dword ptr [rsp+40 + LBM_BATTERY_THRESHOLD.startEnabled], 0
-    jne uis_set_positions
+    jne uis_limit
     cmp dword ptr [rsp+40 + LBM_BATTERY_THRESHOLD.stopEnabled], 0
-    jne uis_set_positions
-    mov dword ptr [rsp+40 + LBM_BATTERY_THRESHOLD.startPercentage], 100
-    mov dword ptr [rsp+40 + LBM_BATTERY_THRESHOLD.stopPercentage], 100
+    jne uis_limit
+    mov dword ptr [rsp+40 + LBM_BATTERY_THRESHOLD.startPercentage], LBM_SLIDER_START_MAX
+    mov dword ptr [rsp+40 + LBM_BATTERY_THRESHOLD.stopPercentage], LBM_SLIDER_STOP_MAX
+    jmp uis_set_positions
+
+uis_limit:
+    ; An active limit has to leave room above its stop threshold.
+    mov eax, dword ptr [rsp+40 + LBM_BATTERY_THRESHOLD.stopPercentage]
+    cmp eax, LBM_LIMIT_STOP_MAX
+    jbe uis_order
+    mov dword ptr [rsp+40 + LBM_BATTERY_THRESHOLD.stopPercentage], LBM_LIMIT_STOP_MAX
+
+uis_order:
+    ; Snapping can collapse a close pair: 79/81 both land on 80.
+    mov eax, dword ptr [rsp+40 + LBM_BATTERY_THRESHOLD.stopPercentage]
+    sub eax, LBM_STEP
+    cmp dword ptr [rsp+40 + LBM_BATTERY_THRESHOLD.startPercentage], eax
+    jbe uis_set_positions
+    mov dword ptr [rsp+40 + LBM_BATTERY_THRESHOLD.startPercentage], eax
 
 uis_set_positions:
     mov r9d, dword ptr [rsp+40 + LBM_BATTERY_THRESHOLD.startPercentage]
@@ -256,13 +389,15 @@ uis_set_positions:
     mov rcx, g_hLblStopVal
     call SetWindowTextW
 
-    mov r9d, 0
+    mov r8d, BST_UNCHECKED
     cmp dword ptr [rsp+40 + LBM_BATTERY_THRESHOLD.startEnabled], 0
     je chk_off
-    mov r9d, BST_CHECKED
+    cmp dword ptr [rsp+40 + LBM_BATTERY_THRESHOLD.stopEnabled], 0
+    je chk_off
+    mov r8d, BST_CHECKED
 
 chk_off:
-    mov r8d, r9d
+    xor r9d, r9d                ; BM_SETCHECK ignores lParam; keep it zero.
     mov edx, BM_SETCHECK
     mov rcx, g_hChkEnable
     call SendMessageW
@@ -298,6 +433,8 @@ WndProc proc
     je wm_dpichanged
     cmp r12d, 2                 ; WM_DESTROY
     je wm_destroy
+    cmp r12d, DM_GETDEFID
+    je wm_getdefid
 
     mov r9, r13                 ; Restore the original lParam.
     mov r8, rsi                 ; Restore the original wParam.
@@ -315,11 +452,30 @@ wm_create:
     mov dword ptr [g_uDpi], eax
 wm_create_dpi_ready:
     ; CreateWindowEx had to choose a size before the target monitor DPI was
-    ; known.  Resize the top-level window to the same DPI that will be used for
-    ; its children; otherwise a high-DPI USB-C monitor clips a correctly scaled
-    ; UI inside a window sized for the primary display.
-    SCALE_ARG 40, 365
-    SCALE_ARG 32, 420
+    ; known.  Derive the frame from the client area the layout was designed
+    ; against: guessing the outer size leaves a right margin that does not match
+    ; the left one, and the error changes with DPI and theme.
+    mov dword ptr [rsp+56], 0   ; rc.left
+    mov dword ptr [rsp+60], 0   ; rc.top
+    SCALE_D 64, LBM_CLIENT_W    ; rc.right
+    SCALE_D 68, LBM_CLIENT_H    ; rc.bottom
+
+    mov eax, dword ptr [g_uDpi]
+    mov dword ptr [rsp+32], eax
+    xor r9d, r9d                ; dwExStyle = 0
+    xor r8d, r8d                ; bMenu = FALSE
+    mov edx, 00CF0000h          ; WS_OVERLAPPEDWINDOW
+    lea rcx, [rsp+56]
+    call AdjustWindowRectExForDpi
+
+    mov eax, dword ptr [rsp+64]
+    sub eax, dword ptr [rsp+56]
+    movsxd rax, eax
+    mov qword ptr [rsp+32], rax ; cx
+    mov eax, dword ptr [rsp+68]
+    sub eax, dword ptr [rsp+60]
+    movsxd rax, eax
+    mov qword ptr [rsp+40], rax ; cy
     mov dword ptr [rsp+48], 16h ; SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE
     xor r9d, r9d
     xor r8d, r8d
@@ -339,7 +495,7 @@ wm_create_dpi_ready:
     call DwmSetWindowAttribute
 
     ; Force DWM to recalculate the non-client frame after backdrop changes.
-    mov dword ptr [rsp+48], 37  ; SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER
+    mov dword ptr [rsp+48], 39  ; SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER
     mov QWORD PTR [rsp+32], 0
     mov QWORD PTR [rsp+40], 0
     xor r9d, r9d
@@ -405,10 +561,10 @@ wm_create_dpi_ready:
     mov QWORD PTR [rsp+72], 0
     mov QWORD PTR [rsp+64], rbx ; hWndParent = rbx
     SCALE_ARG 56, 26
-    SCALE_ARG 48, 340
+    SCALE_ARG 48, LBM_CONTENT_W
     SCALE_ARG 40, 15
-    SCALE_ARG 32, 20
-    mov r9d, 50000000h          ; WS_CHILD | WS_VISIBLE
+    SCALE_ARG 32, LBM_MARGIN
+    mov r9d, WS_CHILD_VISIBLE
     lea r8, str_lblMainTitle
     lea rdx, str_staticClass
     xor ecx, ecx                ; dwExStyle = 0
@@ -426,10 +582,10 @@ wm_create_dpi_ready:
     mov QWORD PTR [rsp+72], 0
     mov QWORD PTR [rsp+64], rbx
     SCALE_ARG 56, 20
-    SCALE_ARG 48, 220
+    SCALE_ARG 48, LBM_LBL_W
     SCALE_ARG 40, 55
-    SCALE_ARG 32, 20
-    mov r9d, 50000000h
+    SCALE_ARG 32, LBM_MARGIN
+    mov r9d, WS_CHILD_VISIBLE
     lea r8, str_lblStart
     lea rdx, str_staticClass
     xor ecx, ecx
@@ -446,10 +602,10 @@ wm_create_dpi_ready:
     mov QWORD PTR [rsp+72], ID_LBL_START_VAL
     mov QWORD PTR [rsp+64], rbx
     SCALE_ARG 56, 20
-    SCALE_ARG 48, 50
+    SCALE_ARG 48, LBM_VAL_W
     SCALE_ARG 40, 55
-    SCALE_ARG 32, 240
-    mov r9d, 50000002h          ; WS_CHILD | WS_VISIBLE | SS_RIGHT
+    SCALE_ARG 32, LBM_VAL_X
+    mov r9d, WS_CHILD_VISIBLE or SS_RIGHT
     lea r8, str_lblStart
     lea rdx, str_staticClass
     xor ecx, ecx
@@ -467,20 +623,22 @@ wm_create_dpi_ready:
     mov QWORD PTR [rsp+72], ID_SLIDER_START
     mov QWORD PTR [rsp+64], rbx
     SCALE_ARG 56, 32
-    SCALE_ARG 48, 340
+    SCALE_ARG 48, LBM_CONTENT_W
     SCALE_ARG 40, 80
-    SCALE_ARG 32, 20
-    mov r9d, 50000001h          ; WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS
+    SCALE_ARG 32, LBM_MARGIN
+    mov r9d, WS_CHILD_VISIBLE or WS_TABSTOP or TBS_AUTOTICKS
     xor r8, r8
     lea rdx, str_trackbarClass
     xor ecx, ecx
     call CreateWindowExW
     mov g_hSliderStart, rax
-    mov r9d, 95 or (40 shl 16)
+    mov r9d, LBM_SLIDER_START_MIN or (LBM_SLIDER_START_MAX shl 16)
     mov r8d, 1
     mov edx, TBM_SETRANGE
     mov rcx, rax
     call SendMessageW
+    mov rcx, g_hSliderStart
+    call ApplyStepMetrics
 
     ; Stop Lbl
     mov QWORD PTR [rsp+88], 0
@@ -489,10 +647,10 @@ wm_create_dpi_ready:
     mov QWORD PTR [rsp+72], 0
     mov QWORD PTR [rsp+64], rbx
     SCALE_ARG 56, 20
-    SCALE_ARG 48, 220
+    SCALE_ARG 48, LBM_LBL_W
     SCALE_ARG 40, 125
-    SCALE_ARG 32, 20
-    mov r9d, 50000000h
+    SCALE_ARG 32, LBM_MARGIN
+    mov r9d, WS_CHILD_VISIBLE
     lea r8, str_lblStop
     lea rdx, str_staticClass
     xor ecx, ecx
@@ -509,10 +667,10 @@ wm_create_dpi_ready:
     mov QWORD PTR [rsp+72], ID_LBL_STOP_VAL
     mov QWORD PTR [rsp+64], rbx
     SCALE_ARG 56, 20
-    SCALE_ARG 48, 50
+    SCALE_ARG 48, LBM_VAL_W
     SCALE_ARG 40, 125
-    SCALE_ARG 32, 240
-    mov r9d, 50000002h
+    SCALE_ARG 32, LBM_VAL_X
+    mov r9d, WS_CHILD_VISIBLE or SS_RIGHT
     lea r8, str_lblStop
     lea rdx, str_staticClass
     xor ecx, ecx
@@ -530,20 +688,22 @@ wm_create_dpi_ready:
     mov QWORD PTR [rsp+72], ID_SLIDER_STOP
     mov QWORD PTR [rsp+64], rbx
     SCALE_ARG 56, 32
-    SCALE_ARG 48, 340
+    SCALE_ARG 48, LBM_CONTENT_W
     SCALE_ARG 40, 150
-    SCALE_ARG 32, 20
-    mov r9d, 50000001h
+    SCALE_ARG 32, LBM_MARGIN
+    mov r9d, WS_CHILD_VISIBLE or WS_TABSTOP or TBS_AUTOTICKS
     xor r8, r8
     lea rdx, str_trackbarClass
     xor ecx, ecx
     call CreateWindowExW
     mov g_hSliderStop, rax
-    mov r9d, 100 or (45 shl 16)
+    mov r9d, LBM_SLIDER_STOP_MIN or (LBM_SLIDER_STOP_MAX shl 16)
     mov r8d, 1
     mov edx, TBM_SETRANGE
     mov rcx, rax
     call SendMessageW
+    mov rcx, g_hSliderStop
+    call ApplyStepMetrics
 
     ; Checkbox Enable
     mov QWORD PTR [rsp+88], 0
@@ -552,10 +712,10 @@ wm_create_dpi_ready:
     mov QWORD PTR [rsp+72], ID_CHK_ENABLE
     mov QWORD PTR [rsp+64], rbx
     SCALE_ARG 56, 24
-    SCALE_ARG 48, 280
+    SCALE_ARG 48, LBM_CONTENT_W ; Full content width, like every other row.
     SCALE_ARG 40, 195
-    SCALE_ARG 32, 20
-    mov r9d, 50000003h          ; WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX
+    SCALE_ARG 32, LBM_MARGIN
+    mov r9d, WS_CHILD_VISIBLE or WS_TABSTOP or BS_AUTOCHECKBOX
     lea r8, str_chkText
     lea rdx, str_buttonClass
     xor ecx, ecx
@@ -573,11 +733,31 @@ wm_create_dpi_ready:
     mov QWORD PTR [rsp+72], ID_BTN_APPLY
     mov QWORD PTR [rsp+64], rbx
     SCALE_ARG 56, 34
-    SCALE_ARG 48, 155
+    SCALE_ARG 48, LBM_BTN_W
     SCALE_ARG 40, 235
-    SCALE_ARG 32, 20
-    mov r9d, 50000001h
+    SCALE_ARG 32, LBM_BTN_X1
+    mov r9d, WS_CHILD_VISIBLE or WS_TABSTOP or BS_DEFPUSHBUTTON
     lea r8, str_btnApplyText
+    lea rdx, str_buttonClass
+    xor ecx, ecx
+    call CreateWindowExW
+    mov r8, g_hFont
+    mov edx, 30h
+    mov rcx, rax
+    call SendMessageW
+
+    ; Button Defaults
+    mov QWORD PTR [rsp+88], 0
+    mov rax, g_hInstance
+    mov QWORD PTR [rsp+80], rax
+    mov QWORD PTR [rsp+72], ID_BTN_DEFAULTS
+    mov QWORD PTR [rsp+64], rbx
+    SCALE_ARG 56, 34
+    SCALE_ARG 48, LBM_BTN_W
+    SCALE_ARG 40, 235
+    SCALE_ARG 32, LBM_BTN_X2
+    mov r9d, WS_CHILD_VISIBLE or WS_TABSTOP
+    lea r8, str_btnDefaultsText
     lea rdx, str_buttonClass
     xor ecx, ecx
     call CreateWindowExW
@@ -593,10 +773,10 @@ wm_create_dpi_ready:
     mov QWORD PTR [rsp+72], ID_BTN_DISABLE
     mov QWORD PTR [rsp+64], rbx
     SCALE_ARG 56, 34
-    SCALE_ARG 48, 155
+    SCALE_ARG 48, LBM_BTN_W
     SCALE_ARG 40, 235
-    SCALE_ARG 32, 190
-    mov r9d, 50000000h
+    SCALE_ARG 32, LBM_BTN_X3
+    mov r9d, WS_CHILD_VISIBLE or WS_TABSTOP
     lea r8, str_btnDisableText
     lea rdx, str_buttonClass
     xor ecx, ecx
@@ -613,10 +793,10 @@ wm_create_dpi_ready:
     mov QWORD PTR [rsp+72], ID_LBL_STATUS
     mov QWORD PTR [rsp+64], rbx
     SCALE_ARG 56, 20
-    SCALE_ARG 48, 360
+    SCALE_ARG 48, LBM_CONTENT_W
     SCALE_ARG 40, 285
-    SCALE_ARG 32, 20
-    mov r9d, 50000000h
+    SCALE_ARG 32, LBM_MARGIN
+    mov r9d, WS_CHILD_VISIBLE
     lea r8, str_statusMissing
     lea rdx, str_staticClass
     xor ecx, ecx
@@ -646,43 +826,82 @@ wm_hscroll:
     call SendMessageW
     mov ebp, eax
 
-    ; The upper slider at 100% is the friendly representation of unrestricted
-    ; charging. Pull the lower slider to 100% as well; Apply will disable both
-    ; Lenovo threshold-control flags for this special state.
-    cmp ebp, 100
-    jne enforce_threshold_order
-    mov rax, g_hSliderStop
+    ; Pull the dragged value onto the grid before anything else looks at it.
+    ; The thumb is written back below, so the control follows the magnet.
+    mov ecx, edi
+    call SnapToStep
+    mov ecx, LBM_SLIDER_START_MIN
+    mov edx, LBM_SLIDER_START_MAX
+    call ClampRange
+    mov edi, eax
+
+    mov ecx, ebp
+    call SnapToStep
+    mov ecx, LBM_SLIDER_STOP_MIN
+    mov edx, LBM_SLIDER_STOP_MAX
+    call ClampRange
+    mov ebp, eax
+
+    ; The pair has exactly two shapes: both thumbs at the top, which is the
+    ; released state, or a real limit whose stop sits below the top with a full
+    ; step of room under it. Dragging a thumb off the top turns the limit on,
+    ; dragging one onto the top turns it off, and the thumbs travel together.
+    mov rax, g_hSliderStart
     cmp r13, rax
-    jne enforce_threshold_order
-    mov edi, 100
+    je hs_start_dragged
+
+    cmp ebp, LBM_SLIDER_STOP_MAX
+    jne hs_limit_on
+    mov edi, LBM_SLIDER_START_MAX   ; Stop parked at the top: release the pair.
+    jmp write_back_positions
+
+hs_start_dragged:
+    cmp edi, LBM_SLIDER_START_MAX
+    jne hs_start_below_top
+    mov ebp, LBM_SLIDER_STOP_MAX    ; Start parked at the top: release the pair.
+    jmp write_back_positions
+
+hs_start_below_top:
+    cmp ebp, LBM_SLIDER_STOP_MAX
+    jne hs_limit_on
+    lea ebp, [edi + LBM_STEP]       ; Leaving the top arms the limit.
+
+hs_limit_on:
+    ; A limit that stops at 100% is not a limit, and the driver rejects it.
+    cmp ebp, LBM_LIMIT_STOP_MAX
+    jbe hs_order
+    mov ebp, LBM_LIMIT_STOP_MAX
+
+hs_order:
+    mov eax, ebp
+    sub eax, LBM_STEP
+    cmp edi, eax
+    jbe write_back_positions
+    mov rax, g_hSliderStart
+    cmp r13, rax
+    jne adjust_start_slider
+
+    ; Dragging start pushes stop up while there is room above it.
+    lea ebp, [edi + LBM_STEP]
+    cmp ebp, LBM_LIMIT_STOP_MAX
+    jbe write_back_positions
+    mov ebp, LBM_LIMIT_STOP_MAX
+
+adjust_start_slider:
+    mov edi, ebp
+    sub edi, LBM_STEP
+
+write_back_positions:
     mov r9d, edi
     mov r8d, 1
     mov edx, TBM_SETPOS
     mov rcx, g_hSliderStart
     call SendMessageW
-    jmp sync_labels
 
-enforce_threshold_order:
-    ; Keep the start threshold strictly below the stop threshold in real time.
-    cmp edi, ebp
-    jl sync_labels
-    mov rax, g_hSliderStart
-    cmp r13, rax
-    jne adjust_start_slider
-    lea ebp, [edi+1]
     mov r9d, ebp
     mov r8d, 1
     mov edx, TBM_SETPOS
     mov rcx, g_hSliderStop
-    call SendMessageW
-    jmp sync_labels
-
-adjust_start_slider:
-    lea edi, [ebp-1]
-    mov r9d, edi
-    mov r8d, 1
-    mov edx, TBM_SETPOS
-    mov rcx, g_hSliderStart
     call SendMessageW
 
 sync_labels:
@@ -699,7 +918,28 @@ sync_labels:
     lea rdx, [rsp+64]
     mov rcx, g_hLblStopVal
     call SetWindowTextW
+
+    ; The thumbs are the switch, so the box always shows what Apply will do:
+    ; ticked whenever a real limit is set, cleared at the released position.
+    mov r8d, BST_CHECKED
+    cmp ebp, LBM_SLIDER_STOP_MAX
+    jne hs_write_check
+    mov r8d, BST_UNCHECKED
+
+hs_write_check:
+    xor r9d, r9d
+    mov edx, BM_SETCHECK
+    mov rcx, g_hChkEnable
+    call SendMessageW
+
+hscroll_done:
     xor eax, eax
+    jmp wp_exit
+
+wm_getdefid:
+    ; IsDialogMessageW asks the frame which control Enter should press. Without
+    ; an answer it falls back to IDOK, which this window does not own.
+    mov eax, (DC_HASDEFID shl 16) or ID_BTN_APPLY
     jmp wp_exit
 
 wm_settingchange:
@@ -758,7 +998,29 @@ wm_command:
     je btn_apply
     cmp eax, ID_BTN_DISABLE
     je btn_disable
+    cmp eax, ID_BTN_DEFAULTS
+    je btn_defaults
+    xor eax, eax                ; Handled: notifications we ignore return zero.
     jmp wp_exit
+
+btn_defaults:
+    ; Load the Lenovo Vantage pair into the controls only. Nothing reaches the
+    ; driver until Apply, so this stays an undoable preview.
+    mov r9d, LBM_DEFAULT_START
+    mov r8d, 1
+    mov edx, TBM_SETPOS
+    mov rcx, g_hSliderStart
+    call SendMessageW
+
+    mov r9d, LBM_DEFAULT_STOP
+    mov r8d, 1
+    mov edx, TBM_SETPOS
+    mov rcx, g_hSliderStop
+    call SendMessageW
+
+    mov edi, LBM_DEFAULT_START
+    mov ebp, LBM_DEFAULT_STOP
+    jmp sync_labels             ; Ticks the box: the pair is a real limit.
 
 btn_apply:
     xor r9d, r9d
@@ -780,7 +1042,7 @@ btn_apply:
     jne read_enable_checkbox
 
     ; A 100% upper limit means "no limit", matching Lenovo Vantage behavior.
-    mov edi, 100
+    ; The start percentage is kept as-is so re-enabling restores the pair.
     mov r8d, 0
     mov r12d, 1
     jmp do_set
@@ -792,9 +1054,11 @@ read_enable_checkbox:
     mov rcx, g_hChkEnable
     call SendMessageW
     mov r8d, 0
+    mov r12d, 1                 ; Unticked box disables: report that, not "applied".
     cmp eax, BST_CHECKED
     jne do_set
     mov r8d, 1
+    xor r12d, r12d
 
 do_set:
     mov edx, ebp
@@ -895,10 +1159,16 @@ dpi_initialized:
     mov g_hInstance, rax
     mov rbx, rax                ; RBX = hInstance
 
-    ; 2. Load the application icon embedded in resource.rc and arrow cursor.
-    mov edx, IDI_LBM            ; MAKEINTRESOURCEW(IDI_LBM)
-    mov rcx, rbx                ; hInstance: load from this executable
+    ; 2. Load embedded application icon (ID 101) and arrow cursor.
+    mov edx, 101                ; Resource ID 101
+    mov rcx, rbx                ; rcx = hInstance
     call LoadIconW
+    test rax, rax
+    jnz icon_loaded
+    mov edx, 32512              ; Fallback: IDI_APPLICATION
+    xor ecx, ecx
+    call LoadIconW
+icon_loaded:
     mov rsi, rax                ; RSI = hIcon
 
     mov edx, 32512              ; IDC_ARROW
@@ -963,6 +1233,14 @@ msg_loop:
     call GetMessageW
     test eax, eax
     jle gui_fail
+
+    ; Give the frame dialog keyboard behaviour: Tab walks the controls and
+    ; Enter presses the default button. Neither works from a bare message loop.
+    lea rdx, [rsp+40]
+    mov rcx, rbx
+    call IsDialogMessageW
+    test eax, eax
+    jnz msg_loop
 
     lea rcx, [rsp+40]
     call TranslateMessage

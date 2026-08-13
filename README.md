@@ -19,7 +19,7 @@ LBM is a native x64 utility for configuring Lenovo battery charge thresholds on
 Windows. One executable provides two front ends over the same implementation:
 a command-line interface and a Win32 graphical interface.
 
-The current release binary is **17,408 bytes (17.00 KiB)**. It is written in
+The current release binary is **20,480 bytes (20.00 KiB)**. It is written in
 MASM x64, linked with `/NODEFAULTLIB`, and has no C runtime, .NET, Visual C++
 Redistributable, Lenovo user-mode DLL, or Lenovo Vantage dependency.
 
@@ -48,9 +48,33 @@ lbm.exe --gui
 lbm.exe -g
 ```
 
-The GUI exposes the start and stop thresholds, the threshold enable state, an
-Apply action, and a Disable action. It uses the native Win32 controls and DWM
-APIs, including DPI awareness and the Windows 11 Mica backdrop where available.
+The GUI exposes the start and stop thresholds as two sliders, the threshold
+enable state as a checkbox, and three buttons:
+
+| Button | Action |
+|---|---|
+| `Apply Settings` | Writes the pair on screen to the registry and the driver. This is the default button, so Enter presses it. |
+| `Defaults` | Loads the Lenovo Vantage pair `80/85` into the sliders and ticks the box. Nothing reaches the driver until Apply. |
+| `Charge to 100%` | Releases the limit immediately and parks both thumbs at the right end. |
+
+The sliders are the switch, and they have exactly two shapes:
+
+- **Both thumbs at the right end (`100%`)** — no limit. The checkbox is clear.
+- **Anywhere else** — a real limit, with the start threshold at least one step
+  below the stop threshold. The checkbox is ticked.
+
+Dragging either thumb off the top arms the limit and ticks the box; dragging
+either thumb onto the top releases it and clears the box. The thumbs travel
+together, so the pair can never be inverted or collapsed on screen.
+
+Both sliders move on a five-percent grid, matching Lenovo Vantage: a tick per
+step, keyboard and page area moving one step, and a dragged thumb snapping to
+the nearest step. Tab walks the controls.
+
+The window uses native Win32 controls and DWM APIs, including Per-Monitor V2
+DPI awareness and the Windows 11 Mica backdrop where available. Its frame is
+derived from the client area with `AdjustWindowRectExForDpi`, so every row keeps
+the same margin on both sides at any DPI.
 
 ### CLI
 
@@ -58,7 +82,7 @@ APIs, including DPI awareness and the Windows 11 Mica backdrop where available.
 lbm.exe
 lbm.exe --status
 lbm.exe -s
-lbm.exe --set 75 80
+lbm.exe --set 80 85
 lbm.exe --disable
 lbm.exe --help
 ```
@@ -72,10 +96,19 @@ lbm.exe --help
 | `--help`, `-h` | Display command-line usage |
 | no arguments | Open the graphical interface |
 
-Percentages must be in the range `0..100`, with `start < stop`. GUI and CLI
-call the same `Lbm_SetBatteryThresholds` routine. Disabling through either front
-end writes `100/100`, clears both control flags, and selects automatic charging
-mode in the driver.
+Percentages must be in the range `0..100`, with `start < stop`. The driver
+itself accepts `0..99` and rejects `100`, so a stop request of `100` is treated
+as "no limit" and performs a release instead of a threshold write.
+
+The CLI writes whatever percentage you pass, so it is the precise front end.
+The GUI is restricted to the five-percent grid; a pair stored off the grid is
+displayed snapped, so `63/78` opens as `65/80`.
+
+GUI and CLI call the same `Lbm_SetBatteryThresholds` routine. Disabling through
+either front end clears both control flags, keeps the stored percentages so the
+next enable restores them, clears the driver's threshold pair, and selects
+automatic charging mode. `--status` therefore keeps reporting the last pair
+while the limit is off.
 
 ## Requirements
 
@@ -113,7 +146,11 @@ the driver immediately. A threshold update follows this sequence:
 4. Select threshold or automatic mode with `DeviceIoControl`.
 5. In threshold mode, send the stop percentage followed by the start
    percentage.
-6. Broadcast `WM_SETTINGCHANGE` for compatibility with installed Lenovo
+6. When releasing the limit, clear the stop and start thresholds to `0` before
+   selecting automatic mode. The embedded controller keeps the last stop
+   threshold latched, and Windows keeps reporting smart charging with the pack
+   inhibited, until the pair is cleared.
+7. Broadcast `WM_SETTINGCHANGE` for compatibility with installed Lenovo
    user-mode components.
 
 The driver protocol used by the current x64 implementation is:
@@ -125,8 +162,19 @@ The driver protocol used by the current x64 implementation is:
 | Set start threshold | `0x222630` | `0x00000100 | start` |
 | Set stop threshold | `0x222638` | `0x00000100 | stop` |
 
-Each call uses a four-byte input and a four-byte driver result. No Lenovo
-user-mode bridge DLL is loaded by LBM.
+Each call uses a four-byte input and a four-byte driver result. Bit 31 of the
+result marks a rejected request. No Lenovo user-mode bridge DLL is loaded by
+LBM.
+
+Two properties of this protocol were established by probing the driver on a
+ThinkPad and confirming the resulting `Charging` and `ChargeRate` values
+reported by the `root\wmi` `BatteryStatus` class:
+
+- The threshold commands accept `0..99`. A payload of `0x00000164` (100)
+  returns `0x80000000` and changes nothing.
+- The battery selector `0x00000100` belongs to the threshold commands only.
+  Sending it to `0x22261C` as `0x00000100` does **not** select automatic mode:
+  the pack stays inhibited. Automatic mode is the bare value `0x00000000`.
 
 ## Binary properties
 
@@ -136,7 +184,7 @@ user-mode bridge DLL is loaded by LBM.
 | Source language | MASM x64 |
 | Entry point | `mainCRTStartup` |
 | PE subsystem | Windows GUI |
-| Current size | 17,408 bytes / 17.00 KiB |
+| Current size | 20,480 bytes / 20.00 KiB |
 | C runtime | None |
 | Default libraries | Disabled with `/NODEFAULTLIB` |
 | Lenovo user-mode DLLs | None |

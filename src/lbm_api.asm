@@ -65,7 +65,7 @@ Lbm_GetBatteryThresholds proc
     xor eax, eax
     rep stosb
 
-    ; Open the Lenovo Power Manager configuration root.
+    ; Open the Lenovo Power Manager configuration root used by the C++ build.
     lea rax, [rsp+48]
     mov QWORD PTR [rsp+32], rax
     mov r9d, 20019h or 8         ; KEY_READ | KEY_ENUMERATE_SUBKEYS
@@ -233,11 +233,45 @@ Lbm_SetBatteryThresholds proc
     mov edi, edx
     mov dword ptr [rsp+56], r8d
 
+    ; The driver validates thresholds as 0..99.  A stop request of 100 is not a
+    ; limit at all, so it has to become a release here; otherwise the registry
+    ; is updated and the IOCTL that follows is rejected.
+    cmp dword ptr [rsp+56], 0
+    je sbt_args_ready
+    cmp edi, LBM_MAX_THRESHOLD
+    ja sbt_release_instead
+    cmp esi, edi
+    jb sbt_args_ready
+    lea esi, [edi-1]             ; Keep the pair ordered for the controller.
+    jmp sbt_args_ready
+
+sbt_release_instead:
+    mov dword ptr [rsp+56], 0
+
+sbt_args_ready:
     lea rcx, [rsp+64]
     call Lbm_GetBatteryThresholds
     test eax, eax
     jz sbt_fail
 
+    ; Releasing the limit must not destroy the user's percentages: Lenovo keeps
+    ; them so the next enable restores the previous pair.  Only the control
+    ; flags describe whether the thresholds are active.
+    cmp dword ptr [rsp+56], 0
+    jne sbt_values_ready
+    mov esi, dword ptr [rsp+64 + LBM_BATTERY_THRESHOLD.startPercentage]
+    mov edi, dword ptr [rsp+64 + LBM_BATTERY_THRESHOLD.stopPercentage]
+    cmp esi, 40
+    jb sbt_use_defaults
+    cmp edi, 100
+    ja sbt_use_defaults
+    cmp esi, edi
+    jb sbt_values_ready
+sbt_use_defaults:
+    mov esi, LBM_DEFAULT_START
+    mov edi, LBM_DEFAULT_STOP
+
+sbt_values_ready:
     lea r8, [rsp+224]
     lea r9, str_baseKeyPath
 copy_b2:
@@ -265,7 +299,7 @@ copy_bar2:
 done_bar2:
     lea rax, [rsp+48]
     mov QWORD PTR [rsp+32], rax
-    mov r9d, KEY_SET_VALUE       ; Request only the access required for writes.
+    mov r9d, KEY_SET_VALUE       ; Request only the access used by the C++ build.
     xor r8d, r8d
     lea rdx, [rsp+224]
     mov ecx, 80000002h           ; HKEY_LOCAL_MACHINE
@@ -450,7 +484,26 @@ Lbm_NotifyDriver proc
     jmp nd_close_success
 
 nd_auto_mode:
-    xor r8d, r8d
+    ; Clear the latched pair before releasing the mode, so the embedded
+    ; controller re-evaluates instead of holding the previous stop threshold.
+    ; The driver rejects a threshold of 100 (result bit 31 set); zero is the
+    ; neutral value that means "no threshold".
+    mov r8d, LBM_RELEASE_THRESHOLD
+    or  r8d, LBM_PRIMARY_BATTERY
+    mov edx, IOCTL_LBM_SET_STOP
+    mov rcx, rbx
+    call Lbm_SendBatteryIoctl
+
+    mov r8d, LBM_RELEASE_THRESHOLD
+    or  r8d, LBM_PRIMARY_BATTERY
+    mov edx, IOCTL_LBM_SET_START
+    mov rcx, rbx
+    call Lbm_SendBatteryIoctl
+
+    ; Automatic charge mode. This command takes a bare mode value: the battery
+    ; selector carried by the threshold commands is not part of its payload,
+    ; and 0x100 here leaves the pack inhibited instead of releasing it.
+    mov r8d, LBM_AUTO_MODE
     mov edx, IOCTL_LBM_SET_CHARGE_MODE
     mov rcx, rbx
     call Lbm_SendBatteryIoctl

@@ -48,7 +48,7 @@ str_cliHeader      db 0Dh,0Ah,"[+] Lenovo Battery Manager (LBM) [Pure x64 Assemb
 str_cliUsage       db "Usage: lbm.exe [option]",0Dh,0Ah
                    db "  lbm.exe                          Display current charge thresholds",0Dh,0Ah
                    db "  lbm.exe --status                 Display current charge thresholds",0Dh,0Ah
-                   db "  lbm.exe --set <start> <stop>     Enable and set thresholds (example: 75 80)",0Dh,0Ah
+                   db "  lbm.exe --set <start> <stop>     Enable and set thresholds (example: 80 85)",0Dh,0Ah
                    db "  lbm.exe --disable                Disable thresholds and charge to 100%",0Dh,0Ah
                    db "  lbm.exe --gui                    Launch the Mica GUI",0Dh,0Ah
                    db "  lbm.exe --help                   Display this help",0Dh,0Ah
@@ -288,7 +288,12 @@ dpi_done:
     mov rcx, rbx
     call CommandLineToArgvW
     mov rsi, rax
+    xor edi, edi
+    test rsi, rsi
+    jz argv_ready
     mov edi, dword ptr [rsp+128]
+
+argv_ready:
 
     mov ecx, ATTACH_PARENT_PROCESS
     call AttachConsole
